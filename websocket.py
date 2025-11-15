@@ -152,6 +152,20 @@ async def websocket_handler():
                                         if len(key_bytes) == 32:
                                             audio.channels[i].audio.key = list(key_bytes)
                                             print(f"AES key decoded for channel {audio.channels[i].audio.channel_id}")
+                                        
+                                        # If GPIO is already active at startup, send transmit_started immediately
+                                        # This tells the server to start sending audio for this channel
+                                        if audio.channels[i].audio.gpio_active:
+                                            await ws.send(json.dumps({
+                                                "transmit_started": {
+                                                    "affiliation_id": "12345",
+                                                    "user_name": "EchoStream",
+                                                    "agency_name": "TestAgency",
+                                                    "channel_id": audio.channels[i].audio.channel_id,
+                                                    "time": int(time.time())
+                                                }
+                                            }))
+                                            print(f"[INFO] Sent transmit_started for channel {audio.channels[i].audio.channel_id} (GPIO already active)")
                             
                 except json.JSONDecodeError:
                     pass
