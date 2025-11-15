@@ -545,6 +545,11 @@ def audio_output_worker(audio_stream: AudioStream):
     
     is_passthrough_target = is_configured_passthrough_channel_id(audio_stream.channel_id)
     
+    # Track statistics
+    output_count = 0
+    silence_count = 0
+    buffer_empty_count = 0
+    
     while not global_interrupted.is_set() and audio_stream.transmitting:
         if audio_stream.output_stream is None:
             time.sleep(0.1)
@@ -579,6 +584,14 @@ def audio_output_worker(audio_stream: AudioStream):
                 frames_filled = 0
                 
                 with audio_stream.output_jitter.mutex:
+                    jitter_frames = audio_stream.output_jitter.frame_count
+                    
+                    if jitter_frames == 0:
+                        buffer_empty_count += 1
+                        # Log buffer empty status occasionally
+                        if buffer_empty_count == 1 or buffer_empty_count % 500 == 0:
+                            print(f"[JITTER EMPTY] Channel {audio_stream.channel_id}: Buffer empty (count={buffer_empty_count}) - no UDP packets received yet")
+                    
                     while frames_filled < 1024:
                         if audio_stream.output_jitter.frame_count > 0:
                             frame = audio_stream.output_jitter.frames[audio_stream.output_jitter.read_index]
@@ -623,6 +636,29 @@ def audio_output_worker(audio_stream: AudioStream):
             
             # Write to output stream
             if samples_to_play is not None and len(samples_to_play) > 0:
+                # Calculate RMS to detect if playing audio or silence
+                rms = np.sqrt(np.mean(samples_to_play**2))
+                is_silence = rms < 0.001
+                
+                if is_silence:
+                    silence_count += 1
+                else:
+                    output_count += 1
+                    # Reset silence count when we get audio
+                    silence_count = 0
+                
+                # Log status occasionally
+                if output_count % 500 == 0 or (silence_count > 0 and silence_count % 500 == 0):
+                    with audio_stream.output_jitter.mutex:
+                        jitter_frames = audio_stream.output_jitter.frame_count
+                    
+                    if is_silence:
+                        print(f"[AUDIO OUT] Channel {audio_stream.channel_id}: Playing SILENCE "
+                              f"(RMS={rms:.6f}, jitter_frames={jitter_frames}, empty_count={buffer_empty_count})")
+                    else:
+                        print(f"[AUDIO OUT] Channel {audio_stream.channel_id}: Playing AUDIO "
+                              f"(RMS={rms:.4f}, jitter_frames={jitter_frames})")
+                
                 audio_stream.output_stream.write(samples_to_play.tobytes(), exception_on_underflow=False)
             
             time.sleep(0.01)  # Small delay to avoid busy waiting

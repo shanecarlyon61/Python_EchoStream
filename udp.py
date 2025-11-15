@@ -122,12 +122,27 @@ def process_received_audio(audio_stream: 'audio.AudioStream', opus_data: bytes, 
     try:
         import audio  # Import here to avoid circular import
         
+        # Track reception count
+        static_receive_count = getattr(process_received_audio, '_receive_count', {})
+        if channel_id not in static_receive_count:
+            static_receive_count[channel_id] = 0
+        static_receive_count[channel_id] += 1
+        process_received_audio._receive_count = static_receive_count
+        
+        # Log first few packets and then occasionally
+        if static_receive_count[channel_id] <= 5 or static_receive_count[channel_id] % 500 == 0:
+            print(f"[UDP AUDIO] Channel {channel_id}: Received audio packet #{static_receive_count[channel_id]} ({len(opus_data)} bytes)")
+        
         if audio_stream.decoder is None:
+            if static_receive_count[channel_id] <= 5:
+                print(f"[UDP ERROR] Channel {channel_id}: Decoder is None!")
             return
         
         # Decode Opus to PCM (1920 samples)
         pcm_bytes = audio_stream.decoder.decode(opus_data, SAMPLES_PER_FRAME)
         if not pcm_bytes:
+            if static_receive_count[channel_id] <= 5:
+                print(f"[UDP ERROR] Channel {channel_id}: Opus decode returned empty")
             return
         
         # Convert int16 PCM to float samples
@@ -140,6 +155,8 @@ def process_received_audio(audio_stream: 'audio.AudioStream', opus_data: bytes, 
         
         # Add frame to jitter buffer
         with audio_stream.output_jitter.mutex:
+            buffer_before = audio_stream.output_jitter.frame_count
+            
             # Check if buffer is full
             if audio_stream.output_jitter.frame_count >= JITTER_BUFFER_SIZE:
                 # Drop oldest frame (circular buffer)
@@ -151,10 +168,11 @@ def process_received_audio(audio_stream: 'audio.AudioStream', opus_data: bytes, 
                 
                 jitter_drop_count[channel_index] += 1
                 if jitter_drop_count[channel_index] % 100 == 0:
-                    print(f"[JITTER DROP] Channel {channel_id}: Dropped frame (total drops: {jitter_drop_count[channel_index]})")
+                    print(f"[JITTER DROP] Channel {channel_id}: Dropped frame at idx {old_read_idx} (total drops: {jitter_drop_count[channel_index]})")
             
             # Add new frame
-            frame = audio_stream.output_jitter.frames[audio_stream.output_jitter.write_index]
+            write_idx = audio_stream.output_jitter.write_index
+            frame = audio_stream.output_jitter.frames[write_idx]
             frame.samples[:len(samples)] = samples
             frame.sample_count = len(samples)
             frame.valid = True
@@ -163,10 +181,22 @@ def process_received_audio(audio_stream: 'audio.AudioStream', opus_data: bytes, 
                 audio_stream.output_jitter.write_index + 1
             ) % JITTER_BUFFER_SIZE
             audio_stream.output_jitter.frame_count += 1
+            
+            # Log when buffer transitions from empty to having data
+            if buffer_before == 0 and audio_stream.output_jitter.frame_count > 0:
+                print(f"[JITTER RECOVERY] Channel {channel_id}: Buffer refilled! frames={audio_stream.output_jitter.frame_count}, "
+                      f"write_idx={audio_stream.output_jitter.write_index}, read_idx={audio_stream.output_jitter.read_index}")
+            
+            # Log buffer status occasionally
+            if static_receive_count[channel_id] <= 5 or static_receive_count[channel_id] % 500 == 0:
+                print(f"[JITTER WRITE] Channel {channel_id}: Added frame at idx {write_idx}, "
+                      f"frames={audio_stream.output_jitter.frame_count}/{JITTER_BUFFER_SIZE}, "
+                      f"read_idx={audio_stream.output_jitter.read_index}, packets_received={static_receive_count[channel_id]}")
     
     except Exception as e:
-        if udp_debug_enabled():
-            print(f"Error processing received audio: {e}")
+        print(f"[UDP ERROR] Error processing received audio for channel {channel_id}: {e}")
+        import traceback
+        traceback.print_exc()
 
 def udp_listener_worker(arg=None):
     """
@@ -217,34 +247,55 @@ def udp_listener_worker(arg=None):
                                 break
                         
                         if not target_stream:
+                            # Log missing channel occasionally
+                            static_missing_count = getattr(udp_listener_worker, '_missing_channel_count', {})
+                            if channel_id not in static_missing_count:
+                                static_missing_count[channel_id] = 0
+                            static_missing_count[channel_id] += 1
+                            udp_listener_worker._missing_channel_count = static_missing_count
+                            
+                            if static_missing_count[channel_id] <= 5 or static_missing_count[channel_id] % 500 == 0:
+                                active_channels = [audio.channels[i].audio.channel_id 
+                                                 for i in range(MAX_CHANNELS) if audio.channels[i].active]
+                                print(f"[UDP ERROR] Channel {channel_id} not found! Active channels: {active_channels}")
                             continue
                         
                         # Decode base64 data
                         encrypted_data = crypto.decode_base64(data)
                         
-                        if len(encrypted_data) > 0:
-                            # Check if key is zero
-                            key_is_zero = all(b == 0 for b in target_stream.key)
+                        if len(encrypted_data) == 0:
+                            static_b64_count = getattr(udp_listener_worker, '_b64_fail_count', {})
+                            if channel_id not in static_b64_count:
+                                static_b64_count[channel_id] = 0
+                            static_b64_count[channel_id] += 1
+                            udp_listener_worker._b64_fail_count = static_b64_count
                             
-                            if not key_is_zero:
-                                zero_key_warned[target_index] = False
-                            
-                            # Decrypt the data
-                            decrypted = crypto.decrypt_data(encrypted_data, bytes(target_stream.key))
-                            
-                            if decrypted:
-                                # Decode Opus audio and add to jitter buffer
-                                process_received_audio(target_stream, decrypted, channel_id, target_index)
+                            if static_b64_count[channel_id] <= 5:
+                                print(f"[UDP ERROR] Channel {channel_id}: Base64 decode failed")
+                            continue
+                        
+                        # Check if key is zero
+                        key_is_zero = all(b == 0 for b in target_stream.key)
+                        
+                        if not key_is_zero:
+                            zero_key_warned[target_index] = False
+                        
+                        # Decrypt the data
+                        decrypted = crypto.decrypt_data(encrypted_data, bytes(target_stream.key))
+                        
+                        if decrypted:
+                            # Decode Opus audio and add to jitter buffer
+                            process_received_audio(target_stream, decrypted, channel_id, target_index)
+                        else:
+                            if key_is_zero and target_index >= 0:
+                                if not zero_key_warned[target_index]:
+                                    print(f"[UDP ERROR] Channel {channel_id}: AES key not set (all zeros)")
+                                    zero_key_warned[target_index] = True
                             else:
-                                if key_is_zero and target_index >= 0:
-                                    if not zero_key_warned[target_index]:
-                                        print(f"UDP Listener: AES key not set for channel {channel_id}")
-                                        zero_key_warned[target_index] = True
-                                else:
-                                    if target_index >= 0:
-                                        decrypt_fail_count[target_index] += 1
-                                        if decrypt_fail_count[target_index] == 1 or decrypt_fail_count[target_index] % 50 == 0:
-                                            print(f"UDP Listener: Decryption failed for channel {channel_id}")
+                                if target_index >= 0:
+                                    decrypt_fail_count[target_index] += 1
+                                    if decrypt_fail_count[target_index] == 1 or decrypt_fail_count[target_index] % 50 == 0:
+                                        print(f"[UDP ERROR] Channel {channel_id}: Decryption failed (count: {decrypt_fail_count[target_index]})")
                 
                 except json.JSONDecodeError:
                     if udp_debug_enabled():
