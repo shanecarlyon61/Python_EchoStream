@@ -50,10 +50,29 @@ def setup_global_udp(config: Dict) -> bool:
         global_udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         global_udp_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         
+        # Bind to a local port to receive packets from server
+        # Use the same port as the server port if available, otherwise bind to any available port
+        try:
+            local_port = config.get('local_udp_port', config['udp_port'])
+            global_udp_socket.bind(('0.0.0.0', local_port))
+            bound_port = global_udp_socket.getsockname()[1]
+            print(f"UDP socket bound to local port {bound_port}")
+        except OSError as e:
+            # If binding to the configured port fails, try any available port
+            try:
+                global_udp_socket.bind(('0.0.0.0', 0))
+                bound_port = global_udp_socket.getsockname()[1]
+                print(f"UDP socket bound to local port {bound_port} (fallback)")
+            except Exception as bind_err:
+                print(f"Failed to bind UDP socket: {bind_err}")
+                global_udp_socket.close()
+                global_udp_socket = None
+                return False
+        
         # Configure server address from config
         global_server_addr = (config['udp_host'], config['udp_port'])
         
-        print(f"Global UDP socket configured for {config['udp_host']}:{config['udp_port']}")
+        print(f"Global UDP socket configured for {config['udp_host']}:{config['udp_port']} (bound to local port {bound_port})")
         
         # Send initial heartbeat packet
         heartbeat_msg = b'{"type":"KEEP_ALIVE"}'
