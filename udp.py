@@ -7,10 +7,12 @@ import json
 import os
 import time
 import numpy as np
-from typing import Optional, Dict
-from echostream import global_interrupted, MAX_CHANNELS, SAMPLES_PER_FRAME
-import audio
+from typing import Optional, Dict, TYPE_CHECKING
+from echostream import global_interrupted, MAX_CHANNELS, SAMPLES_PER_FRAME, JITTER_BUFFER_SIZE
 import crypto
+
+if TYPE_CHECKING:
+    import audio
 
 # Global UDP state
 global_udp_socket: Optional[socket.socket] = None
@@ -107,7 +109,7 @@ def heartbeat_worker(arg=None):
     print("Heartbeat worker stopped")
     return None
 
-def process_received_audio(audio_stream: audio.AudioStream, opus_data: bytes, channel_id: str, channel_index: int):
+def process_received_audio(audio_stream: 'audio.AudioStream', opus_data: bytes, channel_id: str, channel_index: int):
     """
     Process received audio: decode Opus and add to jitter buffer
     
@@ -118,6 +120,8 @@ def process_received_audio(audio_stream: audio.AudioStream, opus_data: bytes, ch
         channel_index: Channel index
     """
     try:
+        import audio  # Import here to avoid circular import
+        
         if audio_stream.decoder is None:
             return
         
@@ -199,6 +203,9 @@ def udp_listener_worker(arg=None):
                     data = json_data.get('data', '')
                     
                     if msg_type == 'audio':
+                        # Import here to avoid circular import
+                        import audio
+                        
                         # Find the channel
                         target_stream = None
                         target_index = -1
