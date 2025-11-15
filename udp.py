@@ -225,6 +225,7 @@ def udp_listener_worker(arg=None):
         return None
     
     packet_count = 0
+    last_log_time = time.time()
     
     while not global_interrupted.is_set():
         try:
@@ -234,6 +235,12 @@ def udp_listener_worker(arg=None):
             buffer, client_addr = global_udp_socket.recvfrom(8192)
             
             packet_count += 1
+            
+            # Log packet reception occasionally
+            current_time = time.time()
+            if packet_count <= 10 or (current_time - last_log_time) >= 10.0:
+                print(f"[UDP RECV] Received packet #{packet_count} from {client_addr} ({len(buffer)} bytes)")
+                last_log_time = current_time
             
             if buffer:
                 try:
@@ -245,6 +252,10 @@ def udp_listener_worker(arg=None):
                     data = json_data.get('data', '')
                     
                     if msg_type == 'audio':
+                        # Log received audio packet info
+                        if packet_count <= 10 or packet_count % 500 == 0:
+                            print(f"[UDP PARSE] Packet #{packet_count}: type=audio, channel_id={channel_id}, data_len={len(data)}")
+                        
                         # Import here to avoid circular import
                         import audio
                         
