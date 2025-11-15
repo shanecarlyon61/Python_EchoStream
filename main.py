@@ -1,0 +1,222 @@
+"""
+EchoStream Main - Main entry point for the EchoStream application
+"""
+import signal
+import sys
+import time
+import threading
+from echostream import global_interrupted, global_channel_ids, global_channel_count, MAX_CHANNELS
+import config
+import audio
+import websocket
+import gpio
+import udp
+import mqtt
+import tone_detect
+import s3_upload
+
+def handle_interrupt(sig, frame):
+    """Handle interrupt signal (Ctrl+C)"""
+    print("\nShutdown signal received, cleaning up...")
+    global_interrupted.set()
+    
+    # Cleanup audio devices
+    audio.cleanup_audio_devices()
+    
+    # Close WebSocket
+    if websocket.global_ws_client:
+        websocket.global_ws_client = None
+    
+    # Stop audio streams
+    for i in range(MAX_CHANNELS):
+        if audio.channels[i].active:
+            audio.channels[i].audio.transmitting = False
+            
+            if audio.channels[i].audio.input_stream:
+                try:
+                    audio.channels[i].audio.input_stream.stop_stream()
+                    audio.channels[i].audio.input_stream.close()
+                except Exception:
+                    pass
+                audio.channels[i].audio.input_stream = None
+            
+            if audio.channels[i].audio.output_stream:
+                try:
+                    audio.channels[i].audio.output_stream.stop_stream()
+                    audio.channels[i].audio.output_stream.close()
+                except Exception:
+                    pass
+                audio.channels[i].audio.output_stream = None
+    
+    # Close UDP socket
+    if udp.global_udp_socket:
+        try:
+            udp.global_udp_socket.close()
+        except Exception:
+            pass
+        udp.global_udp_socket = None
+    
+    # Stop audio passthrough
+    audio.stop_audio_passthrough()
+    
+    # Stop tone detection
+    tone_detect.stop_tone_detection()
+    
+    # Cleanup MQTT
+    mqtt.cleanup_mqtt()
+    
+    # Terminate PyAudio
+    if audio.pa_instance:
+        try:
+            audio.pa_instance.terminate()
+        except Exception:
+            pass
+
+def main():
+    """Main function"""
+    # Initialize global variables
+    global_interrupted.clear()
+    
+    # Load channel configuration from JSON file
+    print("Loading channel configuration from /home/will/.an/config.json...")
+    channel_ids = [""] * MAX_CHANNELS
+    global_channel_count = config.load_channel_config(channel_ids)
+    
+    if global_channel_count > 0:
+        for i in range(global_channel_count):
+            global_channel_ids[i] = channel_ids[i]
+        print(f"Successfully loaded {global_channel_count} channels from config")
+    else:
+        print("No channels loaded from config, using generic defaults")
+        for i in range(4):
+            global_channel_ids[i] = f"channel_{i + 1}"
+        global_channel_count = 4
+    
+    # Initialize tone detection system FIRST (before loading config)
+    if not tone_detect.init_tone_detection():
+        print("Failed to initialize tone detection system", file=sys.stderr)
+        return 1
+    
+    # Load complete configuration including tone detection settings
+    print("[MAIN] Loading complete configuration from /home/will/.an/config.json...")
+    if config.load_complete_config():
+        print("[MAIN] Complete configuration loaded successfully")
+    else:
+        print("[MAIN] ERROR: Failed to load JSON config - NO TONE DETECTION AVAILABLE")
+        print("[MAIN] Please check /home/will/.an/config.json file exists and is readable")
+        return 1
+    
+    if not audio.initialize_portaudio():
+        print("PortAudio initialization failed", file=sys.stderr)
+        return 1
+    
+    # Initialize audio devices
+    if not audio.initialize_audio_devices():
+        print("Audio device initialization failed", file=sys.stderr)
+        return 1
+    
+    # Initialize tone detection control
+    if not audio.init_tone_detect_control():
+        print("Failed to initialize tone detection control", file=sys.stderr)
+        return 1
+    
+    # Initialize shared audio buffer
+    if not audio.init_shared_audio_buffer():
+        print("Failed to initialize shared audio buffer", file=sys.stderr)
+        return 1
+    
+    # Setup signal handler
+    signal.signal(signal.SIGINT, handle_interrupt)
+    signal.signal(signal.SIGTERM, handle_interrupt)
+    
+    # Start GPIO monitor thread
+    gpio_thread = threading.Thread(target=gpio.gpio_monitor_worker, daemon=True)
+    gpio_thread.start()
+    
+    print(f"Setting up {global_channel_count} channels...")
+    
+    # Setup channels
+    for i in range(global_channel_count):
+        print(f"Setting up channel {i + 1} with ID: {global_channel_ids[i]}")
+        if not audio.setup_channel(audio.channels[i], global_channel_ids[i]):
+            print(f"Failed to setup channel {i + 1} ({global_channel_ids[i]})", file=sys.stderr)
+            return 1
+    
+    # Initialize audio passthrough
+    if not audio.init_audio_passthrough():
+        print("Failed to initialize audio passthrough", file=sys.stderr)
+        return 1
+    
+    # Connect global WebSocket
+    if not websocket.connect_global_websocket():
+        print("Failed to connect WebSocket", file=sys.stderr)
+        return 1
+    
+    # Start audio passthrough
+    if not audio.start_audio_passthrough():
+        print("Failed to start audio passthrough", file=sys.stderr)
+        return 1
+    
+    # Start tone detection
+    if not tone_detect.start_tone_detection():
+        print("Failed to start tone detection", file=sys.stderr)
+        return 1
+    
+    # Start tone detection worker thread
+    def tone_detection_worker():
+        """Worker thread that processes shared audio buffer for tone detection"""
+        print("[INFO] Tone detection thread started")
+        
+        while not global_interrupted.is_set():
+            try:
+                # Wait for data in shared buffer
+                with audio.global_shared_buffer.mutex:
+                    if not audio.global_shared_buffer.valid:
+                        audio.global_shared_buffer.data_ready.wait(timeout=0.1)
+                    
+                    if audio.global_shared_buffer.valid and audio.global_shared_buffer.sample_count > 0:
+                        # Process audio for tone detection
+                        samples = audio.global_shared_buffer.samples[:audio.global_shared_buffer.sample_count].copy()
+                        sample_count = audio.global_shared_buffer.sample_count
+                        
+                        # Process audio
+                        tone_detect.process_audio_python_approach(samples, sample_count)
+                
+                time.sleep(0.01)  # Small delay to avoid busy waiting
+            except Exception as e:
+                if not global_interrupted.is_set():
+                    print(f"[ERROR] Tone detection worker error: {e}")
+                time.sleep(0.1)
+        
+        print("[INFO] Tone detection thread stopped")
+    
+    tone_thread = threading.Thread(target=tone_detection_worker, daemon=True)
+    tone_thread.start()
+    
+    # Start WebSocket thread
+    ws_thread = threading.Thread(target=websocket.global_websocket_thread, daemon=True)
+    ws_thread.start()
+    
+    print(f"All {global_channel_count} channels running with single WebSocket. Press Ctrl+C to stop.")
+    
+    # Wait for threads
+    try:
+        while not global_interrupted.is_set():
+            time.sleep(1)
+    except KeyboardInterrupt:
+        handle_interrupt(None, None)
+    
+    # Cleanup
+    tone_detect.stop_tone_detection()
+    audio.stop_audio_passthrough()
+    audio.cleanup_audio_devices()
+    mqtt.cleanup_mqtt()
+    
+    if audio.pa_instance:
+        audio.pa_instance.terminate()
+    
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
+
