@@ -26,7 +26,7 @@ gpio_chip: Optional[int] = None
 
 def init_gpio_pin(pin: int) -> bool:
     """
-    Initialize a GPIO pin as input with pull-up resistor
+    Initialize a GPIO pin as input with pull-up resistor using lgpio library
     
     Args:
         pin: GPIO pin number (not physical pin)
@@ -36,24 +36,29 @@ def init_gpio_pin(pin: int) -> bool:
     """
     global gpio_chip
     
+    # Open GPIO chip if not already open
     if gpio_chip is None:
         gpio_chip = lgpio.gpiochip_open(0)
         if gpio_chip < 0:
-            print(f"ERROR: Cannot open GPIO chip 0")
+            print(f"ERROR: Cannot open GPIO chip 0 (error code: {gpio_chip})")
             return False
+        print(f"GPIO chip 0 opened successfully (handle: {gpio_chip})")
     
-    # Set pin as input with pull-up (pinctrl for Raspberry Pi 5)
+    # Claim pin as input with pull-up resistor using lgpio
     try:
-        lgpio.gpio_claim_input(gpio_chip, pin, lgpio.SET_PULL_UP)
-        print(f"GPIO pin {pin} initialized successfully")
+        result = lgpio.gpio_claim_input(gpio_chip, pin, lgpio.SET_PULL_UP)
+        if result < 0:
+            print(f"ERROR: Cannot claim GPIO pin {pin} as input (error code: {result})")
+            return False
+        print(f"GPIO pin {pin} initialized successfully as input with pull-up")
         return True
     except Exception as e:
-        print(f"ERROR: Cannot configure GPIO pin {pin}: {e}")
+        print(f"ERROR: Exception configuring GPIO pin {pin}: {e}")
         return False
 
 def read_gpio_pin(pin: int) -> int:
     """
-    Read current state of a GPIO pin
+    Read current state of a GPIO pin using lgpio library
     
     Args:
         pin: GPIO pin number
@@ -65,13 +70,22 @@ def read_gpio_pin(pin: int) -> int:
     """
     global gpio_chip
     
-    if gpio_chip is None:
+    if gpio_chip is None or gpio_chip < 0:
         return -1
     
     try:
+        # Use lgpio.gpio_read to get the GPIO value
         value = lgpio.gpio_read(gpio_chip, pin)
-        return value  # 0 = low, 1 = high
-    except Exception:
+        
+        # lgpio returns 0 for LOW, 1 for HIGH, negative for errors
+        if value < 0:
+            # Error code returned
+            return -1
+        
+        # Valid value: 0 (LOW/active) or 1 (HIGH/inactive)
+        return value
+    except Exception as e:
+        # Exception occurred, return error
         return -1
 
 def cleanup_gpio(pin: int):
