@@ -201,21 +201,55 @@ def start_transmission_for_channel(audio_stream: AudioStream) -> bool:
     device_index = get_device_for_channel(audio_stream.channel_id)
     audio_stream.device_index = device_index
     
-    # Try primary device first
-    devices_to_try = [device_index]
+    # Build list of devices to try - check capabilities first
+    devices_to_try = []
     
-    # Add fallback devices: try other USB devices or default device
+    # Check primary device
     try:
-        default_device = pa_instance.get_default_input_device_info()['index']
-        if default_device != device_index:
-            devices_to_try.append(default_device)
-        
-        # Try other USB devices
-        for i in range(MAX_CHANNELS):
-            if usb_devices[i] not in devices_to_try and usb_devices[i] >= 0:
-                devices_to_try.append(usb_devices[i])
+        device_info = pa_instance.get_device_info_by_index(device_index)
+        if device_info['maxInputChannels'] > 0:
+            devices_to_try.append(device_index)
     except Exception:
         pass
+    
+    # Add other USB devices that support input
+    for i in range(MAX_CHANNELS):
+        if usb_devices[i] >= 0 and usb_devices[i] not in devices_to_try:
+            try:
+                device_info = pa_instance.get_device_info_by_index(usb_devices[i])
+                if device_info['maxInputChannels'] > 0:
+                    devices_to_try.append(usb_devices[i])
+            except Exception:
+                pass
+    
+    # Add default input device if not already in list
+    try:
+        default_device_info = pa_instance.get_default_input_device_info()
+        default_device = default_device_info['index']
+        if default_device not in devices_to_try and default_device_info['maxInputChannels'] > 0:
+            devices_to_try.append(default_device)
+    except Exception:
+        pass
+    
+    # Try all available devices (0 to device_count-1) as last resort
+    if len(devices_to_try) == 0:
+        try:
+            device_count = pa_instance.get_device_count()
+            for i in range(device_count):
+                try:
+                    device_info = pa_instance.get_device_info_by_index(i)
+                    if device_info['maxInputChannels'] > 0:
+                        devices_to_try.append(i)
+                        if len(devices_to_try) >= 4:  # Limit to first 4 that support input
+                            break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    
+    if len(devices_to_try) == 0:
+        print(f"Channel {audio_stream.channel_id}: No input devices found")
+        return False
     
     # Try each device until one works
     for attempt, try_device in enumerate(devices_to_try):
@@ -223,99 +257,121 @@ def start_transmission_for_channel(audio_stream: AudioStream) -> bool:
         output_opened = False
         
         try:
-            # Try to open input stream (48kHz, 1024 frame buffer)
+            # Get device info to check capabilities
             try:
-                audio_stream.input_stream = pa_instance.open(
-                    format=pyaudio.paFloat32,
-                    channels=1,
-                    rate=SAMPLE_RATE,
-                    input=True,
-                    input_device_index=try_device,
-                    frames_per_buffer=1024,
-                    stream_callback=None
-                )
-                audio_stream.device_index = try_device
-                input_opened = True
-                print(f"Channel {audio_stream.channel_id}: Input stream opened on device {try_device}")
-            except Exception as e:
-                if attempt < len(devices_to_try) - 1:
-                    print(f"Channel {audio_stream.channel_id}: Failed to open input on device {try_device}: {e}, trying next device...")
-                    continue
-                else:
-                    print(f"Channel {audio_stream.channel_id}: Failed to open input on device {try_device}: {e}")
-                    input_opened = False
-            
-            # If input failed and this is the last device, we're done
-            if not input_opened:
-                if attempt >= len(devices_to_try) - 1:
-                    print(f"Channel {audio_stream.channel_id}: Failed to open input on all devices")
-                    return False
-                continue
-            
-            # Try to open output stream (48kHz, 1024 frame buffer) - only if we have input
-            if input_opened:
+                device_info = pa_instance.get_device_info_by_index(try_device)
+                device_name = device_info.get('name', f'device_{try_device}')
+                has_input = device_info['maxInputChannels'] > 0
+                has_output = device_info['maxOutputChannels'] > 0
+                
+                if not has_input:
+                    if attempt < len(devices_to_try) - 1:
+                        print(f"Channel {audio_stream.channel_id}: Device {try_device} ({device_name}) doesn't support input, trying next...")
+                        continue
+                    else:
+                        print(f"Channel {audio_stream.channel_id}: Device {try_device} ({device_name}) doesn't support input")
+                        continue
+                
+                # Try to open input stream (48kHz, 1024 frame buffer)
                 try:
-                    audio_stream.output_stream = pa_instance.open(
+                    audio_stream.input_stream = pa_instance.open(
                         format=pyaudio.paFloat32,
                         channels=1,
                         rate=SAMPLE_RATE,
-                        output=True,
-                        output_device_index=try_device,
+                        input=True,
+                        input_device_index=try_device,
                         frames_per_buffer=1024,
                         stream_callback=None
                     )
-                    output_opened = True
-                    print(f"Channel {audio_stream.channel_id}: Output stream opened on device {try_device}")
+                    audio_stream.device_index = try_device
+                    input_opened = True
+                    print(f"Channel {audio_stream.channel_id}: Input stream opened on device {try_device} ({device_name})")
                 except Exception as e:
-                    print(f"Warning: Channel {audio_stream.channel_id}: Output stream failed on device {try_device}: {e}")
-                    print(f"Channel {audio_stream.channel_id}: Continuing in input-only mode")
-                    audio_stream.output_stream = None
-                    output_opened = False
-            
-            # Start streams - only start what we successfully opened
-            if input_opened and audio_stream.input_stream:
-                try:
-                    audio_stream.input_stream.start_stream()
-                except Exception as e:
-                    print(f"Warning: Channel {audio_stream.channel_id}: Failed to start input stream: {e}")
-                    try:
-                        audio_stream.input_stream.close()
-                    except:
-                        pass
-                    audio_stream.input_stream = None
-                    input_opened = False
+                    if attempt < len(devices_to_try) - 1:
+                        print(f"Channel {audio_stream.channel_id}: Failed to open input on device {try_device} ({device_name}): {e}, trying next device...")
+                        continue
+                    else:
+                        print(f"Channel {audio_stream.channel_id}: Failed to open input on device {try_device} ({device_name}): {e}")
+                        input_opened = False
+                
+                # If input failed and this is the last device, we're done
+                if not input_opened:
+                    if attempt >= len(devices_to_try) - 1:
+                        print(f"Channel {audio_stream.channel_id}: Failed to open input on all devices")
+                        return False
                     continue
-            
-            if output_opened and audio_stream.output_stream:
-                try:
-                    audio_stream.output_stream.start_stream()
-                except Exception as e:
-                    print(f"Warning: Channel {audio_stream.channel_id}: Failed to start output stream: {e}")
+                
+                # Try to open output stream on SAME device (48kHz, 1024 frame buffer) - only if device supports output
+                if input_opened and has_output:
                     try:
-                        audio_stream.output_stream.close()
-                    except:
-                        pass
-                    audio_stream.output_stream = None
-                    output_opened = False
-            
-            # If we got at least input stream, we're good
-            if input_opened and audio_stream.input_stream:
-                audio_stream.transmitting = True
-                return True
-            else:
-                # Clean up if we didn't succeed
-                if audio_stream.input_stream:
+                        audio_stream.output_stream = pa_instance.open(
+                            format=pyaudio.paFloat32,
+                            channels=1,
+                            rate=SAMPLE_RATE,
+                            output=True,
+                            output_device_index=try_device,  # Use same device for output
+                            frames_per_buffer=1024,
+                            stream_callback=None
+                        )
+                        output_opened = True
+                        print(f"Channel {audio_stream.channel_id}: Output stream opened on device {try_device} ({device_name})")
+                    except Exception as e:
+                        print(f"Warning: Channel {audio_stream.channel_id}: Output stream failed on device {try_device} ({device_name}): {e}")
+                        print(f"Channel {audio_stream.channel_id}: Continuing in input-only mode")
+                        audio_stream.output_stream = None
+                        output_opened = False
+                else:
+                    if not has_output:
+                        print(f"Warning: Channel {audio_stream.channel_id}: Device {try_device} ({device_name}) doesn't support output, using input-only mode")
+                
+                # Start streams - only start what we successfully opened
+                if input_opened and audio_stream.input_stream:
                     try:
-                        audio_stream.input_stream.close()
-                    except:
-                        pass
-                    audio_stream.input_stream = None
-                if audio_stream.output_stream:
+                        audio_stream.input_stream.start_stream()
+                    except Exception as e:
+                        print(f"Warning: Channel {audio_stream.channel_id}: Failed to start input stream: {e}")
+                        try:
+                            audio_stream.input_stream.close()
+                        except:
+                            pass
+                        audio_stream.input_stream = None
+                        input_opened = False
+                        continue
+                
+                if output_opened and audio_stream.output_stream:
                     try:
-                        audio_stream.output_stream.close()
-                    except:
-                        pass
-                    audio_stream.output_stream = None
+                        audio_stream.output_stream.start_stream()
+                    except Exception as e:
+                        print(f"Warning: Channel {audio_stream.channel_id}: Failed to start output stream: {e}")
+                        try:
+                            audio_stream.output_stream.close()
+                        except:
+                            pass
+                        audio_stream.output_stream = None
+                        output_opened = False
+                
+                # If we got at least input stream, we're good
+                if input_opened and audio_stream.input_stream:
+                    audio_stream.transmitting = True
+                    return True
+                else:
+                    # Clean up if we didn't succeed
+                    if audio_stream.input_stream:
+                        try:
+                            audio_stream.input_stream.close()
+                        except:
+                            pass
+                        audio_stream.input_stream = None
+                    if audio_stream.output_stream:
+                        try:
+                            audio_stream.output_stream.close()
+                        except:
+                            pass
+                        audio_stream.output_stream = None
+                    continue
+                    
+            except Exception as e:
+                print(f"Channel {audio_stream.channel_id}: Exception checking device {try_device}: {e}")
                 continue
                 
         except Exception as e:
