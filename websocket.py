@@ -99,7 +99,24 @@ async def websocket_handler():
             global_ws_client = ws
             print("[INFO] WebSocket connection established for all channels")
             
-            # Register all active channels - send connect messages
+            # Register all active channels with WebSocket - send transmit_started for all channels
+            # This matches the C implementation behavior (api_call.c line 782)
+            print("[INFO] Registering all active channels with WebSocket")
+            for i in range(global_channel_count):
+                if audio.channels[i].active:
+                    print(f"[INFO] Registering channel {audio.channels[i].audio.channel_id}")
+                    await ws.send(json.dumps({
+                        "transmit_started": {
+                            "affiliation_id": "12345",
+                            "user_name": "EchoStream",
+                            "agency_name": "TestAgency",
+                            "channel_id": audio.channels[i].audio.channel_id,
+                            "time": int(time.time())
+                        }
+                    }))
+                    print(f"[INFO] Sent transmit_started for channel {audio.channels[i].audio.channel_id}")
+            
+            # Send connect messages for all active channels
             for i in range(global_channel_count):
                 if audio.channels[i].active:
                     now = int(time.time())
@@ -153,19 +170,8 @@ async def websocket_handler():
                                             audio.channels[i].audio.key = list(key_bytes)
                                             print(f"AES key decoded for channel {audio.channels[i].audio.channel_id}")
                                         
-                                        # If GPIO is already active at startup, send transmit_started immediately
-                                        # This tells the server to start sending audio for this channel
-                                        if audio.channels[i].audio.gpio_active:
-                                            await ws.send(json.dumps({
-                                                "transmit_started": {
-                                                    "affiliation_id": "12345",
-                                                    "user_name": "EchoStream",
-                                                    "agency_name": "TestAgency",
-                                                    "channel_id": audio.channels[i].audio.channel_id,
-                                                    "time": int(time.time())
-                                                }
-                                            }))
-                                            print(f"[INFO] Sent transmit_started for channel {audio.channels[i].audio.channel_id} (GPIO already active)")
+                                        # Note: transmit_started was already sent for all channels when WebSocket connected
+                                        # GPIO monitor will send transmit_started/transmit_ended on GPIO state changes
                             
                 except json.JSONDecodeError:
                     pass
